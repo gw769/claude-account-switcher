@@ -1,0 +1,579 @@
+#!/usr/bin/env bash
+# claude-account — switch Claude Desktop on Linux between several logged-in accounts.
+#
+# Each account keeps its own data folder under ~/.config/Claude-accounts/<name>,
+# and ~/.config/Claude is a symlink to the active one. The app always sees the
+# same path, so the app menu, the dock and claude:// login links all follow the
+# active account without any extra flags.
+#
+# Run `claude-account help` for usage.
+
+set -Eeuo pipefail
+
+readonly VERSION="0.1.0"
+
+CONFIG_HOME=${XDG_CONFIG_HOME:-$HOME/.config}
+LINK="$CONFIG_HOME/Claude"            # where Claude Desktop keeps its data
+STORE="$CONFIG_HOME/Claude-accounts"  # one sub-folder per account
+LOG="$STORE/.switcher.log"
+LOCK="$STORE/.lock"
+# Main executable of the official Linux package; override if installed elsewhere.
+APP_EXE=${CLAUDE_ACCOUNT_EXE:-/usr/lib/claude-desktop/claude-desktop}
+QUIT_TIMEOUT=${CLAUDE_ACCOUNT_QUIT_TIMEOUT:-30}
+
+SELF=$(readlink -f -- "${BASH_SOURCE[0]}")
+UI=${CLAUDE_ACCOUNT_UI:-cli}   # "gui": dialogs instead of terminal output
+ASSUME_YES=0
+
+# ── output ───────────────────────────────────────────────────
+
+log() {
+    mkdir -p -- "$STORE" 2>/dev/null || return 0
+    printf '%s [%s] %s\n' "$(date '+%F %T')" "$$" "$*" >>"$LOG" 2>/dev/null || true
+}
+
+say() {
+    if [[ $UI == gui ]]; then
+        zenity --info --title="Claude 帳號切換" --text="$1" --width=380 2>/dev/null || true
+    else
+        printf '%s\n' "$1"
+    fi
+}
+
+die() {
+    log "error: $1"
+    if [[ $UI == gui ]]; then
+        zenity --error --title="Claude 帳號切換" --text="$1" --width=380 2>/dev/null || true
+    else
+        printf 'claude-account: %s\n' "$1" >&2
+    fi
+    exit 1
+}
+
+notify() {
+    if [[ $UI == gui ]] && command -v notify-send >/dev/null; then
+        notify-send --app-name="Claude 帳號切換" --icon=claude-desktop "$1" 2>/dev/null || true
+    fi
+}
+
+# Ask a yes/no question. Returns 0 for yes. With $3 = ask-anyway, --yes does
+# not answer it (used for force-quitting).
+confirm() {
+    local text=$1 ok_label=${2:-繼續} mode=${3:-}
+    if [[ $ASSUME_YES == 1 && $mode != ask-anyway ]]; then
+        return 0
+    elif [[ $UI == gui ]]; then
+        zenity --question --title="Claude 帳號切換" --text="$text" \
+            --ok-label="$ok_label" --cancel-label="取消" --width=420 2>/dev/null
+    elif [[ -t 0 && -t 1 ]]; then
+        local reply
+        printf '%s\n' "$text"
+        read -r -p "繼續？[y/N] " reply
+        [[ $reply == [yY]* ]]
+    elif [[ $mode == ask-anyway ]]; then
+        return 1
+    else
+        die "需要確認，但目前不是互動式終端機。確定要執行的話請加上 --yes。"
+    fi
+}
+
+on_error() {
+    log "unexpected error at line $1"
+    if [[ $UI == gui ]]; then
+        zenity --error --title="Claude 帳號切換" --width=380 \
+            --text="發生未預期的錯誤（第 $1 行），詳情請看 $LOG" 2>/dev/null || true
+    fi
+}
+trap 'on_error $LINENO' ERR
+
+# ── accounts and the symlink ─────────────────────────────────
+
+valid_name() {
+    [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$ ]]
+}
+
+require_valid_name() {
+    valid_name "$1" || die "帳號名稱「$1」無效：只能用英文字母、數字、- 和 _，最多 32 個字元。"
+}
+
+list_accounts() {
+    local d
+    for d in "$STORE"/*/; do
+        [[ -d $d ]] || continue
+        d=${d%/}
+        printf '%s\n' "${d##*/}"
+    done
+}
+
+account_exists() {
+    [[ -d $STORE/$1 && ! -L $STORE/$1 ]]
+}
+
+# fresh     – Claude has never stored data here
+# unmanaged – ~/.config/Claude is a normal folder (before the first switch)
+# managed   – ~/.config/Claude is our symlink into $STORE
+# foreign   – ~/.config/Claude is a symlink we did not create
+link_state() {
+    if [[ -L $LINK ]]; then
+        local target
+        target=$(readlink -- "$LINK")
+        if [[ ${target%/*} == "$STORE" ]] && account_exists "${target##*/}"; then
+            echo managed
+        else
+            echo foreign
+        fi
+    elif [[ -e $LINK ]]; then
+        echo unmanaged
+    else
+        echo fresh
+    fi
+}
+
+active_account() {
+    if [[ $(link_state) == managed ]]; then
+        local target
+        target=$(readlink -- "$LINK")
+        printf '%s\n' "${target##*/}"
+    fi
+}
+
+require_not_foreign() {
+    if [[ $(link_state) == foreign ]]; then
+        die "$LINK 指向 $(readlink -- "$LINK")，不是由本工具建立的連結，為了安全不會動它。"
+    fi
+}
+
+# Point ~/.config/Claude at an account. The rename is atomic, so the link is
+# never missing, and it refuses to replace a real folder.
+point_link_to() {
+    local tmp="$LINK.switch-$$"
+    if [[ -e $LINK && ! -L $LINK ]]; then
+        log "refusing to replace real folder $LINK"
+        return 1
+    fi
+    ln -s -- "$STORE/$1" "$tmp" || return 1
+    if ! mv -T -f -- "$tmp" "$LINK"; then
+        rm -f -- "$tmp"
+        return 1
+    fi
+    log "linked $LINK -> $STORE/$1"
+}
+
+# Move today's real ~/.config/Claude into the store under a name.
+adopt_current_folder() {
+    local name=$1
+    [[ $(link_state) == unmanaged ]] || return 1
+    mkdir -p -- "$STORE" || return 1
+    mv -T -- "$LINK" "$STORE/$name" || return 1
+    log "moved $LINK to $STORE/$name"
+    point_link_to "$name"
+}
+
+# ── the Claude Desktop process ───────────────────────────────
+
+# PIDs of this user's processes whose executable matches a glob.
+pids_with_exe() {
+    local p
+    # find exits non-zero on /proc entries it may not read (other users); ignore.
+    for p in $(find /proc/[0-9]*/exe -maxdepth 0 -lname "$1" 2>/dev/null || true); do
+        p=${p#/proc/}
+        printf '%s\n' "${p%/exe}"
+    done
+}
+
+# The main (browser) process: our executable without a --type= switch.
+# The trailing * also matches "… (deleted)" right after a package upgrade.
+main_pids() {
+    local pid args
+    for pid in $(pids_with_exe "$APP_EXE*"); do
+        mapfile -d '' -t args 2>/dev/null <"/proc/$pid/cmdline" || continue
+        # Chromium rewrites helper titles into one space-joined string, so
+        # look at the whole line rather than at separate arguments.
+        [[ " ${args[*]} " == *" --type="* ]] && continue
+        printf '%s\n' "$pid"
+    done
+}
+
+# Renderers, crash handler, cowork helper: anything run from the install folder.
+app_pids() {
+    pids_with_exe "${APP_EXE%/*}/*"
+}
+
+claude_running() {
+    [[ -n $(main_pids) ]]
+}
+
+# True when we are a descendant of Claude Desktop (e.g. its terminal panel).
+# Closing the app would then take this script down halfway through a switch.
+inside_claude() {
+    local mains pid=$$ parent
+    mains=" $(main_pids | tr '\n' ' ') "
+    [[ $mains == "  " ]] && return 1
+    while [[ $pid -gt 1 ]]; do
+        [[ $mains == *" $pid "* ]] && return 0
+        parent=$(awk '/^PPid:/ { print $2 }' "/proc/$pid/status" 2>/dev/null) || return 1
+        [[ -n $parent ]] || return 1
+        pid=$parent
+    done
+    return 1
+}
+
+wait_until_gone() { # $1: function listing PIDs, $2: seconds
+    local i
+    for ((i = 0; i < $2 * 4; i++)); do
+        [[ -z $($1) ]] && return 0
+        sleep 0.25
+    done
+    [[ -z $($1) ]]
+}
+
+# Ask Claude Desktop to quit (SIGTERM is handled as a normal quit) and wait.
+quit_claude() {
+    local pids
+    pids=$(main_pids)
+    [[ -n $pids ]] || return 0
+    log "asking Claude Desktop to quit (pid ${pids//$'\n'/ })"
+    # shellcheck disable=SC2086
+    kill -TERM $pids 2>/dev/null || true
+    if ! wait_until_gone main_pids "$QUIT_TIMEOUT"; then
+        log "Claude Desktop still running after ${QUIT_TIMEOUT}s"
+        if ! confirm "Claude Desktop 在 ${QUIT_TIMEOUT} 秒內沒有關閉，可能正在等你回應某個對話框。
+
+要強制關閉嗎？尚未儲存的內容可能會遺失。" "強制關閉" ask-anyway; then
+            return 1
+        fi
+        pids=$(main_pids)
+        log "force-killing Claude Desktop (pid ${pids//$'\n'/ })"
+        # shellcheck disable=SC2086
+        [[ -z $pids ]] || kill -KILL $pids 2>/dev/null || true
+        wait_until_gone main_pids 10 || return 1
+    fi
+    # Let helpers finish writing before the data folder changes under them.
+    wait_until_gone app_pids 10 || log "some helper processes are still running; continuing"
+    log "Claude Desktop closed"
+}
+
+launch_claude() {
+    log "launching Claude Desktop"
+    # 9>&- : Claude must not inherit our lock, or it would hold it forever.
+    setsid -f claude-desktop >/dev/null 2>&1 </dev/null 9>&-
+}
+
+# Run the rest of this command outside Claude Desktop if we were started from it.
+detach_if_inside_claude() {
+    [[ ${CLAUDE_ACCOUNT_DETACHED:-0} == 1 ]] && return 0
+    inside_claude || return 0
+    log "started from inside Claude Desktop; continuing detached: $*"
+    mkdir -p -- "$STORE"
+    # The terminal we were started from closes with Claude, so report through
+    # dialogs from here on when a desktop session is available.
+    local ui=$UI
+    if [[ -n ${WAYLAND_DISPLAY:-}${DISPLAY:-} ]] && command -v zenity >/dev/null; then
+        ui=gui
+    fi
+    CLAUDE_ACCOUNT_DETACHED=1 CLAUDE_ACCOUNT_UI=$ui \
+        setsid -f "$SELF" "$@" --yes </dev/null >>"$LOG" 2>&1
+    if [[ $UI == cli ]]; then
+        echo "Claude Desktop 即將關閉並重新開啟，切換會在背景完成。紀錄：$LOG"
+    fi
+    exit 0
+}
+
+take_lock() {
+    mkdir -p -- "$STORE"
+    exec 9>"$LOCK"
+    flock -n 9 || die "另一個切換正在進行，請稍候再試。"
+}
+
+release_lock() {
+    exec 9>&-
+}
+
+# ── the core operation ───────────────────────────────────────
+
+# Close Claude, rearrange folders, start Claude again.
+#   $1  account to activate, or "" to undo the setup (restore)
+#   $2  name for today's ~/.config/Claude when it is still a real folder, or ""
+#   $3  "always" to start Claude afterwards, "if-running" to start it only if it was open
+#   $4… original command line, used if we have to continue detached
+transition() {
+    local target=$1 adopt_as=$2 relaunch=$3
+    shift 3
+    local was_running=0
+    claude_running && was_running=1
+
+    if [[ $was_running == 1 ]]; then
+        confirm "會先關閉 Claude Desktop，正在執行的 Claude Code 工作階段也會中斷。" "關閉並繼續" || exit 0
+        detach_if_inside_claude "$@"
+    fi
+    take_lock
+
+    if ! quit_claude; then
+        release_lock
+        die "Claude Desktop 沒有關閉，沒有做任何變更。"
+    fi
+
+    local ok=1
+    if [[ -n $adopt_as ]]; then
+        adopt_current_folder "$adopt_as" || ok=0
+    fi
+    if [[ $ok == 1 && -n $target ]] && ! account_exists "$target"; then
+        mkdir -m 700 -p -- "$STORE/$target" && log "created account $target" || ok=0
+    fi
+    if [[ $ok == 1 ]]; then
+        if [[ -n $target ]]; then
+            point_link_to "$target" || ok=0
+        else
+            restore_real_folder || ok=0
+        fi
+    fi
+
+    # Bring Claude back even after a failure, so the user is not left without it.
+    if [[ $relaunch == always || $was_running == 1 ]]; then
+        launch_claude || true
+    fi
+    release_lock
+    [[ $ok == 1 ]] || die "切換沒有完成，詳情請看 $LOG"
+}
+
+restore_real_folder() {
+    local name
+    name=$(active_account)
+    [[ -n $name ]] || return 1
+    rm -- "$LINK" || return 1   # removes the symlink only
+    if ! mv -T -- "$STORE/$name" "$LINK"; then
+        point_link_to "$name"
+        return 1
+    fi
+    log "restored $STORE/$name to $LINK"
+}
+
+# ── commands ─────────────────────────────────────────────────
+
+cmd_list() {
+    local state active name
+    state=$(link_state)
+    active=$(active_account)
+    case $state in
+        fresh) echo "還沒有任何帳號。用 claude-account add <名稱> 新增。" ;;
+        unmanaged) echo "尚未初始化：$LINK 是一般資料夾（目前登入的帳號）。新增帳號時會先替它命名。" ;;
+        foreign) echo "注意：$LINK 指向 $(readlink -- "$LINK")，不是本工具管理的連結。" ;;
+    esac
+    while IFS= read -r name; do
+        [[ -n $name ]] || continue
+        if [[ $name == "$active" ]]; then
+            printf '* %s（使用中）\n' "$name"
+        else
+            printf '  %s\n' "$name"
+        fi
+    done < <(list_accounts)
+    if claude_running; then
+        echo "Claude Desktop：執行中"
+    else
+        echo "Claude Desktop：未執行"
+    fi
+}
+
+cmd_init() {
+    local name=${1:-}
+    [[ -n $name ]] || die "用法：claude-account init <目前帳號的名稱>"
+    require_valid_name "$name"
+    [[ $(link_state) == unmanaged ]] || die "已經初始化過了（或 $LINK 不存在），不需要 init。"
+    account_exists "$name" && die "已經有叫「$name」的帳號。"
+    transition "$name" "$name" if-running init "$name"
+    say "已將目前的帳號命名為「$name」。"
+}
+
+cmd_add() {
+    local name=${1:-} adopt_as=${2:-}
+    [[ -n $name ]] || die "用法：claude-account add <新帳號名稱>"
+    require_valid_name "$name"
+    require_not_foreign
+    account_exists "$name" && die "已經有叫「$name」的帳號。"
+    if [[ $(link_state) != unmanaged ]]; then
+        adopt_as=""
+    else
+        [[ -n $adopt_as ]] || die "請先執行 claude-account init <名稱>，替目前登入的帳號命名，或加上 --as <名稱>。"
+        [[ $adopt_as != "$name" ]] || die "兩個帳號不能同名。"
+        account_exists "$adopt_as" && die "已經有叫「$adopt_as」的帳號。"
+    fi
+    if [[ -n $adopt_as ]]; then
+        transition "$name" "$adopt_as" always add "$name" --as "$adopt_as"
+    else
+        transition "$name" "" always add "$name"
+    fi
+    say "Claude Desktop 正以新帳號「$name」開啟。
+
+等登入畫面出現後登入即可，登入狀態會自動保存。"
+}
+
+cmd_switch() {
+    local name=${1:-}
+    [[ -n $name ]] || die "用法：claude-account switch <帳號名稱>"
+    require_valid_name "$name"
+    require_not_foreign
+    [[ $(link_state) == unmanaged ]] && die "還沒有其他帳號可以切換。先用 claude-account add 新增帳號。"
+    account_exists "$name" || die "沒有叫「$name」的帳號。"
+    if [[ $name == "$(active_account)" ]]; then
+        claude_running || launch_claude
+        say "「$name」已經是目前的帳號。"
+        return 0
+    fi
+    transition "$name" "" always switch "$name"
+    notify "已切換到「$name」"
+    [[ $UI == gui ]] || echo "已切換到「$name」。"
+}
+
+cmd_remove() {
+    local name=${1:-}
+    [[ -n $name ]] || die "用法：claude-account remove <帳號名稱>"
+    require_valid_name "$name"
+    account_exists "$name" || die "沒有叫「$name」的帳號。"
+    [[ $name != "$(active_account)" ]] || die "「$name」正在使用中，請先切換到其他帳號再移除。"
+    command -v gio >/dev/null || die "找不到 gio，無法移到垃圾桶。"
+    confirm "要移除帳號「$name」嗎？
+
+這只會把本機保存的登入資料移到垃圾桶，不會刪除你的 Claude 帳號。" "移到垃圾桶" || exit 0
+    take_lock
+    gio trash -- "$STORE/$name" || die "無法把「$name」移到垃圾桶。"
+    release_lock
+    log "moved account $name to trash"
+    say "已將「$name」移到垃圾桶。"
+}
+
+cmd_restore() {
+    [[ $(link_state) == managed ]] || die "目前沒有使用多帳號設定，不需要還原。"
+    local name
+    name=$(active_account)
+    confirm "會把使用中的帳號「$name」放回 $LINK，變回普通的單一帳號設定。
+其他帳號的資料會留在 $STORE。" "還原" || exit 0
+    transition "" "" if-running restore
+    say "已還原：$LINK 現在是「$name」的資料夾。"
+}
+
+# ── GUI (zenity) ─────────────────────────────────────────────
+
+gui_ask_name() { # $1 prompt, $2 default text
+    local name
+    name=$(zenity --entry --title="Claude 帳號切換" --text="$1" \
+        --entry-text="${2:-}" --width=380 2>/dev/null) || exit 0
+    name=${name//[[:space:]]/}
+    [[ -n $name ]] || exit 0
+    require_valid_name "$name"
+    printf '%s\n' "$name"
+}
+
+gui_pick_account() { # $1 prompt; lists accounts except the active one
+    local active name rows=()
+    active=$(active_account)
+    while IFS= read -r name; do
+        if [[ -n $name && $name != "$active" ]]; then
+            rows+=("$name")
+        fi
+    done < <(list_accounts)
+    [[ ${#rows[@]} -gt 0 ]] || die "沒有其他帳號。"
+    zenity --list --title="Claude 帳號切換" --text="$1" --column="帳號" \
+        --hide-header --width=360 --height=300 "${rows[@]}" 2>/dev/null || exit 0
+}
+
+cmd_gui() {
+    UI=gui
+    command -v zenity >/dev/null || { UI=cli; die "需要 zenity：sudo apt install zenity"; }
+    require_not_foreign
+
+    local active name choice others=0 rows=()
+    active=$(active_account)
+    while IFS= read -r name; do
+        [[ -n $name && $name != "$active" ]] || continue
+        rows+=("switch:$name" "切換到「$name」")
+        others=1
+    done < <(list_accounts)
+    rows+=("add" "新增帳號…")
+    if [[ $others == 1 ]]; then
+        rows+=("remove" "移除帳號…")
+    fi
+
+    local header="目前帳號：<b>${active:-（尚未命名）}</b>"
+    choice=$(zenity --list --title="Claude 帳號切換" --text="$header" \
+        --column="key" --column="動作" --hide-column=1 --print-column=1 \
+        --hide-header --width=380 --height=320 "${rows[@]}" 2>/dev/null) || exit 0
+
+    case $choice in
+        switch:*)
+            cmd_switch "${choice#switch:}"
+            ;;
+        add)
+            local adopt_as=""
+            # gui_ask_name prints nothing on cancel and fails after showing its own error.
+            if [[ $(link_state) == unmanaged ]]; then
+                adopt_as=$(gui_ask_name "第一次使用：先替<b>目前登入</b>的帳號取個名字。" main) || exit 1
+                [[ -n $adopt_as ]] || exit 0
+            fi
+            name=$(gui_ask_name "新帳號的名稱（英文字母、數字、- 或 _）：" "") || exit 1
+            [[ -n $name ]] || exit 0
+            cmd_add "$name" "$adopt_as"
+            ;;
+        remove)
+            name=$(gui_pick_account "要移除哪個帳號？") || exit 0
+            [[ -n $name ]] || exit 0
+            cmd_remove "$name"
+            ;;
+    esac
+}
+
+usage() {
+    cat <<EOF
+claude-account $VERSION — 在多個 Claude Desktop 帳號之間切換（Linux）
+
+用法：
+  claude-account gui                 開啟圖形介面
+  claude-account list                列出帳號，* 為使用中
+  claude-account init <名稱>         替目前登入的帳號命名（第一次使用）
+  claude-account add <名稱>          新增空白帳號並切換過去，然後在 Claude 中登入
+  claude-account switch <名稱>       切換帳號（會關閉並重新開啟 Claude Desktop）
+  claude-account remove <名稱>       把帳號的本機資料移到垃圾桶
+  claude-account restore             還原成普通的單一帳號設定
+
+選項：
+  -y, --yes   不詢問確認
+  --as <名稱> 搭配 add：同時替目前登入的帳號命名（等於先 init）
+
+資料位置：
+  $LINK  →  $STORE/<名稱>
+EOF
+}
+
+main() {
+    local args=() adopt_as="" arg
+    while [[ $# -gt 0 ]]; do
+        arg=$1
+        shift
+        case $arg in
+            -y | --yes) ASSUME_YES=1 ;;
+            --as) adopt_as=${1:-}; shift || true ;;
+            -h | --help) args+=(help) ;;
+            *) args+=("$arg") ;;
+        esac
+    done
+    set -- "${args[@]+"${args[@]}"}"
+
+    local cmd=${1:-help}
+    shift || true
+    case $cmd in
+        gui) cmd_gui ;;
+        list | ls | status) cmd_list ;;
+        init) cmd_init "$@" ;;
+        add | new)
+            if [[ -n $adopt_as ]]; then require_valid_name "$adopt_as"; fi
+            cmd_add "${1:-}" "$adopt_as"
+            ;;
+        switch | use) cmd_switch "$@" ;;
+        remove | rm) cmd_remove "$@" ;;
+        restore) cmd_restore ;;
+        help) usage ;;
+        version | --version) echo "$VERSION" ;;
+        *) usage >&2; exit 2 ;;
+    esac
+}
+
+main "$@"
