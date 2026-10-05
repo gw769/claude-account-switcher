@@ -65,12 +65,32 @@ claude-account restore             還原成普通的單一帳號設定
 
 - **切換會關閉 Claude Desktop**，正在執行的 Claude Code 工作階段會中斷。切換前會先詢問。
 - 一次只能使用一個帳號（Claude Desktop 本身同時只能跑一個）。
-- 每個帳號有自己的設定，包括 MCP 設定檔 `claude_desktop_config.json`。若新帳號也要相同的 MCP 伺服器，請自行複製該檔案。
-- 終端機版 Claude Code（`~/.claude`）和第三方模式的 `~/.config/Claude-3p` 不受影響，所有帳號共用。
 - 移除帳號只會把**本機**登入資料移到垃圾桶，不會刪除你的 Claude 帳號。
 - 若 Claude Desktop 在 30 秒內沒有關閉（例如正在等你確認某個對話框），會詢問是否強制關閉，不會自動強制關閉。
 - 從 Claude Desktop 內的終端機執行時，切換會在背景繼續完成，結果以對話框顯示。
 - 紀錄檔：`~/.config/Claude-accounts/.switcher.log`
+
+## 哪些東西跟著帳號走，哪些共用
+
+**每個帳號各自一份**（存在各自的資料夾，新帳號要重新設定）：
+
+- Desktop app 設定：Bypass permissions 的同意（Settings → Claude Code）、Trusted Cowork folders、通知、預設瀏覽器、介面版面等。
+- MCP 設定檔 `claude_desktop_config.json`。若新帳號也要相同的 MCP 伺服器，請自行複製該檔案。
+- Code 分頁的對話列表：app 依帳號 ID 分開存放，另一個帳號看不到。
+- Chat 分頁的聊天記錄、claude.ai 上的 connectors 和外掛：存在 Anthropic 伺服器，本來就綁帳號。
+
+**所有帳號共用**（在 `~/.claude` 或家目錄，不受切換影響）：
+
+- `~/.claude/settings.json`（例如 `permissions.defaultMode`）、`~/.claude/CLAUDE.md`、`~/.claude/skills/`
+- Claude Code 的記憶和對話紀錄檔（`~/.claude/projects/`）
+- 終端機版 Claude Code，以及第三方模式的 `~/.config/Claude-3p`
+
+**換帳號接著做同一件事：**
+
+- 在兩個帳號都打開**同一個專案資料夾**開 Code 對話。檔案、git 和記憶都在，只是對話列表不同。
+- 要接續完整對話，可以在終端機執行 `claude --resume <對話 ID> --fork-session`。
+
+**已知限制：** 第一次切換前在「No folder」開的舊 Code 對話，切換後 Claude Code 看到的是連結背後的真實路徑（`~/.config/Claude-accounts/<名稱>/…`），會被當成另一個專案，原本的記憶讀不到。建議一律在真正的專案資料夾裡工作。
 
 ## 解除安裝
 
@@ -87,7 +107,7 @@ bash install.sh --uninstall
 bash tests/run.sh
 ```
 
-測試使用假的 Claude 程序與暫存資料夾，不會動到真正的 `~/.config/Claude` 或正在執行的 Claude。
+測試使用假的 Claude 程序，暫存檔放在 repo 內的 `.test-tmp/`（不放 `/tmp`，跑完自動清掉），不會動到真正的 `~/.config/Claude` 或正在執行的 Claude。
 
 ## 致謝
 

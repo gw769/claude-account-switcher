@@ -10,7 +10,9 @@ unset -f grep 2>/dev/null   # some shells wrap grep in a function; use the real 
 
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 SCRIPT="$ROOT/claude-account"
-T=$(mktemp -d "${TMPDIR:-/tmp}/claude-account-test.XXXXXX")
+# Work inside the repo rather than /tmp, which is wiped on reboot or power loss.
+mkdir -p "$ROOT/.test-tmp"
+T=$(mktemp -d "$ROOT/.test-tmp/run.XXXXXX")
 export T
 
 cleanup() {
