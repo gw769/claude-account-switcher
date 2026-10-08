@@ -7,21 +7,23 @@
 ## 運作方式
 
 ```
-~/.config/Claude  →  ~/.config/Claude-accounts/<使用中的帳號>   （符號連結）
+~/.config/Claude               ← 使用中帳號的完整資料（真正的資料夾）
 
 ~/.config/Claude-accounts/
-├── main/      ← 帳號 1 的完整資料（登入狀態、Claude Code 工作階段、設定…）
-├── work/      ← 帳號 2
+├── main  →  ~/.config/Claude  ← 使用中的帳號：指回去的連結
+├── work/                      ← 其他帳號的完整資料（登入狀態、Claude Code 工作階段、設定…）
 └── .switcher.log
 ```
 
 Claude Desktop 永遠讀寫 `~/.config/Claude`，切換帳號就是：
 
 1. 正常關閉 Claude Desktop
-2. 把 `~/.config/Claude` 這個連結改指向另一個帳號的資料夾
+2. 把 `~/.config/Claude` 搬回 `Claude-accounts/<目前帳號>`，再把另一個帳號的資料夾搬到 `~/.config/Claude`（同一個磁碟內改名，瞬間完成）
 3. 重新開啟 Claude Desktop
 
 因為 app 看到的路徑始終不變，**從應用程式選單、Dock 或 `claude://` 登入連結開啟的 Claude，都會自動使用目前的帳號**，不需要額外參數。
+
+`~/.config/Claude` 是真正的資料夾而不是符號連結，所以 Claude Desktop 和 Claude Code 看到的路徑一致，Code 分頁的對話紀錄和記憶不會分成兩份。
 
 ## 安裝
 
@@ -90,12 +92,20 @@ claude-account restore             還原成普通的單一帳號設定
 - 在兩個帳號都打開**同一個專案資料夾**開 Code 對話。檔案、git 和記憶都在，只是對話列表不同。
 - 要接續完整對話，可以在終端機執行 `claude --resume <對話 ID> --fork-session`。
 
-**已知限制：** 第一次切換前在「No folder」開的舊 Code 對話，切換後 Claude Code 看到的是連結背後的真實路徑（`~/.config/Claude-accounts/<名稱>/…`），會被當成另一個專案，原本的記憶讀不到。建議一律在真正的專案資料夾裡工作。
+## 從 0.1.x 升級
+
+0.1.x 把 `~/.config/Claude` 做成指向 `Claude-accounts/<名稱>` 的符號連結。Claude Code 會解析連結、用真實路徑存對話紀錄，Claude Desktop 卻用連結路徑去讀，結果「No folder」對話的紀錄分成兩份：**app 顯示停在第一次切換前的舊內容，新的記憶也讀不到**。
+
+升級方法：`bash install.sh` 之後，切換一次帳號即可（切到目前的帳號也可以：`claude-account switch <目前帳號>`，或在圖形介面選「轉換成新的資料夾配置」）。轉換時會：
+
+- 把使用中的帳號搬到 `~/.config/Claude`，留下指回去的連結，舊路徑照樣能用
+- 把只存在真實路徑下的對話紀錄資料夾（`~/.claude/projects/` 裡）搬到 app 讀的位置，舊位置留連結
+- 新舊兩個位置**都有**紀錄的對話不會自動合併，只寫進紀錄檔並提示。這種情況通常是真實路徑那份比較新，確認後可手動把它放到 app 讀的位置
 
 ## 解除安裝
 
 ```bash
-claude-account restore         # 把使用中的帳號放回 ~/.config/Claude
+claude-account restore         # 讓使用中的帳號留在 ~/.config/Claude，變回單一帳號
 bash install.sh --uninstall
 ```
 
@@ -111,7 +121,7 @@ bash tests/run.sh
 
 ## 致謝
 
-構想來自 [Adam-Zaghloul/claude-desktop-switcher](https://github.com/Adam-Zaghloul/claude-desktop-switcher)。本專案改以符號連結切換，並只關閉 Claude Desktop 主程序，避免 `pkill -f` 誤殺其他程式。
+構想來自 [Adam-Zaghloul/claude-desktop-switcher](https://github.com/Adam-Zaghloul/claude-desktop-switcher)。本專案改以搬動資料夾切換，並只關閉 Claude Desktop 主程序，避免 `pkill -f` 誤殺其他程式。
 
 ## 授權
 

@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
 # claude-account — switch Claude Desktop on Linux between several logged-in accounts.
 #
-# Each account keeps its own data folder under ~/.config/Claude-accounts/<name>,
-# and ~/.config/Claude is a symlink to the active one. The app always sees the
-# same path, so the app menu, the dock and claude:// login links all follow the
-# active account without any extra flags.
+# The active account's data is the real folder ~/.config/Claude, and the other
+# accounts wait in ~/.config/Claude-accounts/<name>. Switching swaps folders by
+# renaming them. The app always sees the same path, so the app menu, the dock
+# and claude:// login links all follow the active account without extra flags.
 #
 # Run `claude-account help` for usage.
 
 set -Eeuo pipefail
 
-readonly VERSION="0.1.0"
+readonly VERSION="0.2.0"
 
 CONFIG_HOME=${XDG_CONFIG_HOME:-$HOME/.config}
 LINK="$CONFIG_HOME/Claude"            # where Claude Desktop keeps its data
@@ -86,7 +86,18 @@ on_error() {
 }
 trap 'on_error $LINENO' ERR
 
-# ── accounts and the symlink ─────────────────────────────────
+# ── accounts and folders ─────────────────────────────────────
+#
+# ~/.config/Claude is the active account's real folder, exactly where Claude
+# Desktop expects it. Inactive accounts wait in $STORE/<name>, and
+# $STORE/<active> is a symlink back to ~/.config/Claude: it marks the active
+# account and keeps paths recorded through it working.
+#
+# Up to 0.1.x it was the other way round: ~/.config/Claude was a symlink into
+# $STORE ("legacy"). Claude Code resolves that symlink but Claude Desktop does
+# not, so the two filed the transcripts of "No folder" sessions under
+# different keys and the app showed stale history. The next switch converts
+# a legacy setup.
 
 valid_name() {
     [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$ ]]
@@ -105,68 +116,155 @@ list_accounts() {
     done
 }
 
-account_exists() {
-    [[ -d $STORE/$1 && ! -L $STORE/$1 ]]
+# The account whose $STORE entry is our symlink to ~/.config/Claude, if any.
+marked_account() {
+    local d
+    for d in "$STORE"/*; do
+        if [[ -L $d && $(readlink -- "$d") == "$LINK" ]] && valid_name "${d##*/}"; then
+            printf '%s\n' "${d##*/}"
+            return 0
+        fi
+    done
 }
 
-# fresh     – Claude has never stored data here
-# unmanaged – ~/.config/Claude is a normal folder (before the first switch)
-# managed   – ~/.config/Claude is our symlink into $STORE
-# foreign   – ~/.config/Claude is a symlink we did not create
+# A stored account, active or not.
+account_exists() {
+    [[ -d $STORE/$1 && ! -L $STORE/$1 ]] || [[ $(marked_account) == "$1" ]]
+}
+
+# fresh     – no ~/.config/Claude and no accounts yet
+# unmanaged – ~/.config/Claude is a normal folder nobody has named yet
+# managed   – ~/.config/Claude is the active account's folder
+# legacy    – ~/.config/Claude is our symlink into $STORE (0.1.x layout)
+# detached  – no ~/.config/Claude but accounts exist (e.g. an interrupted switch)
+# foreign   – ~/.config/Claude is something we did not create
 link_state() {
     if [[ -L $LINK ]]; then
         local target
         target=$(readlink -- "$LINK")
-        if [[ ${target%/*} == "$STORE" ]] && account_exists "${target##*/}"; then
-            echo managed
+        if [[ ${target%/*} == "$STORE" && -d $target && ! -L $target ]] && valid_name "${target##*/}"; then
+            echo legacy
         else
             echo foreign
         fi
+    elif [[ -d $LINK ]]; then
+        if [[ -n $(marked_account) ]]; then echo managed; else echo unmanaged; fi
     elif [[ -e $LINK ]]; then
-        echo unmanaged
+        echo foreign
+    elif [[ -n $(list_accounts) ]]; then
+        echo detached
     else
         echo fresh
     fi
 }
 
 active_account() {
-    if [[ $(link_state) == managed ]]; then
-        local target
-        target=$(readlink -- "$LINK")
-        printf '%s\n' "${target##*/}"
-    fi
+    case $(link_state) in
+        managed) marked_account ;;
+        legacy)
+            local target
+            target=$(readlink -- "$LINK")
+            printf '%s\n' "${target##*/}"
+            ;;
+    esac
 }
 
 require_not_foreign() {
     if [[ $(link_state) == foreign ]]; then
-        die "$LINK 指向 $(readlink -- "$LINK")，不是由本工具建立的連結，為了安全不會動它。"
+        die "$LINK 不是由本工具建立的，為了安全不會動它。"
     fi
 }
 
-# Point ~/.config/Claude at an account. The rename is atomic, so the link is
-# never missing, and it refuses to replace a real folder.
-point_link_to() {
-    local tmp="$LINK.switch-$$"
-    if [[ -e $LINK && ! -L $LINK ]]; then
-        log "refusing to replace real folder $LINK"
-        return 1
+# Make an account the active one: put the current folder back into the store,
+# then move the target's folder to ~/.config/Claude. Every step is a rename on
+# one file system. If the target cannot be moved, the previous account is put
+# back. A legacy setup is converted on the way.
+activate() {
+    local target=$1 state cur=""
+    state=$(link_state)
+    case $state in
+        managed)
+            cur=$(marked_account)
+            [[ $cur != "$target" ]] || return 0
+            rm -- "$STORE/$cur" || return 1   # our marker link only
+            if ! mv -T -- "$LINK" "$STORE/$cur"; then
+                ln -s -- "$LINK" "$STORE/$cur"
+                return 1
+            fi
+            log "moved $LINK back to $STORE/$cur"
+            ;;
+        legacy)
+            cur=$(active_account)   # its data already lives in $STORE/$cur
+            rm -- "$LINK" || return 1   # the old symlink only
+            log "removed old-style link $LINK -> $STORE/$cur"
+            ;;
+        fresh | detached) ;;
+        *)
+            log "refusing to activate $target: $LINK is $state"
+            return 1
+            ;;
+    esac
+    if mv -T -- "$STORE/$target" "$LINK" && ln -s -- "$LINK" "$STORE/$target"; then
+        log "activated $target at $LINK"
+        return 0
     fi
-    ln -s -- "$STORE/$1" "$tmp" || return 1
-    if ! mv -T -f -- "$tmp" "$LINK"; then
-        rm -f -- "$tmp"
-        return 1
+    log "could not activate $target; putting ${cur:-nothing} back"
+    if [[ -d $LINK && ! -L $LINK && ! -e $STORE/$target ]]; then
+        mv -T -- "$LINK" "$STORE/$target"
     fi
-    log "linked $LINK -> $STORE/$1"
+    if [[ -n $cur && ! -e $LINK ]] && mv -T -- "$STORE/$cur" "$LINK"; then
+        ln -s -- "$LINK" "$STORE/$cur"
+    fi
+    return 1
 }
 
-# Move today's real ~/.config/Claude into the store under a name.
+# Give today's real ~/.config/Claude a name. Its data stays where it is.
 adopt_current_folder() {
     local name=$1
     [[ $(link_state) == unmanaged ]] || return 1
     mkdir -p -- "$STORE" || return 1
-    mv -T -- "$LINK" "$STORE/$name" || return 1
-    log "moved $LINK to $STORE/$name"
-    point_link_to "$name"
+    ln -s -- "$LINK" "$STORE/$name" || return 1
+    log "named $LINK as account $name"
+}
+
+# ── Claude Code transcripts ──────────────────────────────────
+
+# Claude Code's folder name for a working directory: every character other
+# than an ASCII letter or digit becomes "-". Claude Code shortens long names
+# in a way not reproduced here, so those print nothing.
+project_key() {
+    local key=${1//[^a-zA-Z0-9]/-}
+    if (( ${#key} <= 200 )); then
+        printf '%s\n' "$key"
+    fi
+}
+
+# Under the legacy layout Claude Code filed the transcripts of "No folder"
+# sessions under the resolved path ($STORE/<name>/…) while Claude Desktop
+# looked under ~/.config/Claude/…. From now on both use ~/.config/Claude/…,
+# so move each such folder to that key and leave a link at the old one.
+# Folders found under both keys are left alone and counted.
+TRANSCRIPT_CONFLICTS=0
+reconcile_transcripts() {
+    local projects=${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects
+    local name rel lit res
+    [[ -d $projects ]] || return 0
+    while IFS= read -r name; do
+        [[ -n $name && -d $STORE/$name/scratch-workspaces ]] || continue
+        while IFS= read -r rel; do
+            lit=$(project_key "$LINK/scratch-workspaces/$rel")
+            res=$(project_key "$STORE/$name/scratch-workspaces/$rel")
+            [[ -n $lit && -n $res && -d $projects/$res && ! -L $projects/$res ]] || continue
+            if [[ ! -e $projects/$lit && ! -L $projects/$lit ]]; then
+                if mv -T -- "$projects/$res" "$projects/$lit" && ln -s -- "$lit" "$projects/$res"; then
+                    log "moved transcripts of $rel to the key Claude Desktop reads"
+                fi
+            else
+                TRANSCRIPT_CONFLICTS=$((TRANSCRIPT_CONFLICTS + 1))
+                log "warning: transcripts of $rel exist under both $lit and $res; left as is"
+            fi
+        done < <(find "$STORE/$name/scratch-workspaces/" -mindepth 3 -maxdepth 3 -type d -printf '%P\n' 2>/dev/null)
+    done < <(list_accounts)
 }
 
 # ── the Claude Desktop process ───────────────────────────────
@@ -314,6 +412,10 @@ transition() {
     fi
 
     local ok=1
+    # Claude is closed now, so no Claude Code process writes transcripts.
+    if [[ $(link_state) == legacy ]]; then
+        reconcile_transcripts || true
+    fi
     if [[ -n $adopt_as ]]; then
         adopt_current_folder "$adopt_as" || ok=0
     fi
@@ -322,7 +424,7 @@ transition() {
     fi
     if [[ $ok == 1 ]]; then
         if [[ -n $target ]]; then
-            point_link_to "$target" || ok=0
+            activate "$target" || ok=0
         else
             restore_real_folder || ok=0
         fi
@@ -334,18 +436,29 @@ transition() {
     fi
     release_lock
     [[ $ok == 1 ]] || die "切換沒有完成，詳情請看 $LOG"
+    if (( TRANSCRIPT_CONFLICTS > 0 )); then
+        say "注意：有 $TRANSCRIPT_CONFLICTS 個「No folder」對話在新舊兩個位置都有紀錄，沒有自動合併。詳情請看 $LOG"
+    fi
 }
 
+# Leave the active account in ~/.config/Claude as a plain folder.
 restore_real_folder() {
     local name
     name=$(active_account)
     [[ -n $name ]] || return 1
-    rm -- "$LINK" || return 1   # removes the symlink only
-    if ! mv -T -- "$STORE/$name" "$LINK"; then
-        point_link_to "$name"
-        return 1
-    fi
-    log "restored $STORE/$name to $LINK"
+    case $(link_state) in
+        managed)
+            rm -- "$STORE/$name" || return 1   # the marker link; the data stays put
+            ;;
+        legacy)
+            rm -- "$LINK" || return 1   # removes the symlink only
+            if ! mv -T -- "$STORE/$name" "$LINK"; then
+                ln -s -- "$STORE/$name" "$LINK"
+                return 1
+            fi
+            ;;
+    esac
+    log "restored $name as the plain folder $LINK"
 }
 
 # ── commands ─────────────────────────────────────────────────
@@ -357,7 +470,9 @@ cmd_list() {
     case $state in
         fresh) echo "還沒有任何帳號。用 claude-account add <名稱> 新增。" ;;
         unmanaged) echo "尚未初始化：$LINK 是一般資料夾（目前登入的帳號）。新增帳號時會先替它命名。" ;;
-        foreign) echo "注意：$LINK 指向 $(readlink -- "$LINK")，不是本工具管理的連結。" ;;
+        legacy) echo "提示：目前是舊版的連結配置，Claude Desktop 可能顯示過時的 Code 對話紀錄。執行 claude-account switch $active 轉換（會重新開啟 Claude Desktop）。" ;;
+        detached) echo "目前沒有使用中的帳號（$LINK 不存在，可能是上次切換被中斷）。用 claude-account switch <名稱> 選一個。" ;;
+        foreign) echo "注意：$LINK 不是本工具管理的。" ;;
     esac
     while IFS= read -r name; do
         [[ -n $name ]] || continue
@@ -380,7 +495,10 @@ cmd_init() {
     require_valid_name "$name"
     [[ $(link_state) == unmanaged ]] || die "已經初始化過了（或 $LINK 不存在），不需要 init。"
     account_exists "$name" && die "已經有叫「$name」的帳號。"
-    transition "$name" "$name" if-running init "$name"
+    # Naming moves nothing, so Claude can keep running.
+    take_lock
+    adopt_current_folder "$name" || die "命名沒有完成，詳情請看 $LOG"
+    release_lock
     say "已將目前的帳號命名為「$name」。"
 }
 
@@ -415,6 +533,11 @@ cmd_switch() {
     [[ $(link_state) == unmanaged ]] && die "還沒有其他帳號可以切換。先用 claude-account add 新增帳號。"
     account_exists "$name" || die "沒有叫「$name」的帳號。"
     if [[ $name == "$(active_account)" ]]; then
+        if [[ $(link_state) == legacy ]]; then
+            transition "$name" "" always switch "$name"
+            say "已把「$name」轉換成新的資料夾配置。"
+            return 0
+        fi
         claude_running || launch_claude
         say "「$name」已經是目前的帳號。"
         return 0
@@ -442,12 +565,20 @@ cmd_remove() {
 }
 
 cmd_restore() {
-    [[ $(link_state) == managed ]] || die "目前沒有使用多帳號設定，不需要還原。"
-    local name
+    local state name
+    state=$(link_state)
+    [[ $state == managed || $state == legacy ]] || die "目前沒有使用多帳號設定，不需要還原。"
     name=$(active_account)
-    confirm "會把使用中的帳號「$name」放回 $LINK，變回普通的單一帳號設定。
+    confirm "會把使用中的帳號「$name」留在 $LINK，變回普通的單一帳號設定。
 其他帳號的資料會留在 $STORE。" "還原" || exit 0
-    transition "" "" if-running restore
+    if [[ $state == managed ]]; then
+        # The data is already in place; only the marker link goes.
+        take_lock
+        restore_real_folder || die "還原沒有完成，詳情請看 $LOG"
+        release_lock
+    else
+        transition "" "" if-running restore
+    fi
     say "已還原：$LINK 現在是「$name」的資料夾。"
 }
 
@@ -488,6 +619,9 @@ cmd_gui() {
         rows+=("switch:$name" "切換到「$name」")
         others=1
     done < <(list_accounts)
+    if [[ $(link_state) == legacy ]]; then
+        rows+=("upgrade" "轉換成新的資料夾配置（修正 Code 對話顯示舊紀錄）")
+    fi
     rows+=("add" "新增帳號…")
     if [[ $others == 1 ]]; then
         rows+=("remove" "移除帳號…")
@@ -501,6 +635,9 @@ cmd_gui() {
     case $choice in
         switch:*)
             cmd_switch "${choice#switch:}"
+            ;;
+        upgrade)
+            cmd_switch "$active"
             ;;
         add)
             local adopt_as=""
@@ -539,7 +676,8 @@ claude-account $VERSION — 在多個 Claude Desktop 帳號之間切換（Linux�
   --as <名稱> 搭配 add：同時替目前登入的帳號命名（等於先 init）
 
 資料位置：
-  $LINK  →  $STORE/<名稱>
+  $LINK           使用中帳號的資料
+  $STORE/<名稱>   其他帳號（使用中的那個是指回 $LINK 的連結）
 EOF
 }
 
