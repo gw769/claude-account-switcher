@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">
+  <title>Claude 账号切换</title>
+  <rect x="2" y="2" width="60" height="60" rx="14" fill="#2563eb"/>
+  <g fill="none" stroke="#fff" stroke-width="5" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M16 24h31m-8-8 8 8-8 8"/>
+    <path d="M48 40H17m8-8-8 8 8 8"/>
+  </g>
+</svg>

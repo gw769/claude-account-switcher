@@ -110,6 +110,7 @@ run_env() {
         CLAUDE_CONFIG_DIR="$T/claude-home" \
         CLAUDE_ACCOUNT_EXE="$T/lib/claude-desktop" \
         CLAUDE_ACCOUNT_QUIT_TIMEOUT=2 \
+        CLAUDE_ACCOUNT_GUI_BACKEND=zenity \
         PATH="$T/bin:$PATH" \
         WAYLAND_DISPLAY="" DISPLAY="" \
         "$@"

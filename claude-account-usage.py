@@ -182,7 +182,7 @@ def api_get(endpoint, token, now):
         raise UsageError("不支持的用量请求")
     request = urllib.request.Request(API + endpoint, headers={
         "Authorization": "Bearer " + token, "anthropic-beta": "oauth-2025-04-20",
-        "User-Agent": "claude-account-switcher/0.4.1", "Accept": "application/json"})
+        "User-Agent": "claude-account-switcher/0.4.3", "Accept": "application/json"})
     try:
         with urllib.request.build_opener(NoRedirect()).open(request, timeout=10) as response:
             raw = response.read(1_000_001)

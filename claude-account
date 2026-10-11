@@ -10,7 +10,7 @@
 
 set -Eeuo pipefail
 
-readonly VERSION="0.4.1-local"
+readonly VERSION="0.4.3-local"
 
 CONFIG_HOME=${XDG_CONFIG_HOME:-$HOME/.config}
 LINK="$CONFIG_HOME/Claude"            # where Claude Desktop keeps its data
@@ -24,6 +24,8 @@ QUIT_TIMEOUT=${CLAUDE_ACCOUNT_QUIT_TIMEOUT:-30}
 SELF=$(readlink -f -- "${BASH_SOURCE[0]}")
 SESSION_HELPER="${SELF%/*}/claude-account-sessions.py"
 USAGE_HELPER="${SELF%/*}/claude-account-usage.py"
+GUI_HELPER="${SELF%/*}/claude-account-gui.py"
+APP_ICON="${XDG_DATA_HOME:-$HOME/.local/share}/icons/hicolor/scalable/apps/claude-account-switcher.svg"
 SESSION_SUMMARY=""
 UI=${CLAUDE_ACCOUNT_UI:-cli}   # "gui": dialogs instead of terminal output
 ASSUME_YES=0
@@ -688,7 +690,7 @@ gui_pick_account() { # $1 prompt; lists accounts except the active one
         --hide-header --width=360 --height=300 "${rows[@]}" 2>/dev/null || exit 0
 }
 
-cmd_gui() {
+cmd_gui_zenity() {
     UI=gui
     command -v zenity >/dev/null || { UI=cli; die "需要 zenity：sudo apt install zenity"; }
     require_not_foreign
@@ -723,13 +725,14 @@ cmd_gui() {
             rows+=("sync" "同步 Code 對話（目前帳號）" "" "" "" "" "")
         fi
         if [[ -d $LINK/.code-sync-backups ]]; then
-            rows+=("backups" "開啟對話同步備份" "" "" "" "" "")
+            rows+=("backups" "查看对话同步备份文件夹" "" "" "" "" "")
         fi
         if [[ $others == 1 ]]; then
             rows+=("remove" "移除帳號…" "" "" "" "" "")
         fi
 
         local header="目前帳號：<b>${active:-（尚未命名）}</b>"
+        header+=$'\nCode 对话同步已开启；每次切号自动同步本机 Code 对话。'
         header+=$'\n额度显示剩余百分比；点击「刷新额度」读取所有账号的最新用量。'
         header+=$'\n窗口常驻；切号后返回此界面，点「关闭」退出。'
         header+=$'\n重置时间使用本机时区：'
@@ -781,6 +784,26 @@ cmd_gui() {
                 ;;
         esac
     done
+}
+
+cmd_gui() {
+    UI=gui
+    require_not_foreign
+    # Retain the old selector for compatibility and its isolated shell tests.
+    if [[ ${CLAUDE_ACCOUNT_GUI_BACKEND:-gtk} == zenity ]]; then
+        cmd_gui_zenity
+        return
+    fi
+    [[ -r $GUI_HELPER && -r $USAGE_HELPER ]] || die "缺少图形界面组件；请重新安装。"
+    local gui_python
+    for gui_python in python3 /usr/bin/python3; do
+        if "$gui_python" -c 'import gi; gi.require_version("Gtk", "3.0"); from gi.repository import Gtk' >/dev/null 2>&1; then
+            "$gui_python" "$GUI_HELPER" --switcher "$SELF" --usage-helper "$USAGE_HELPER" \
+                --active-root "$LINK" --store "$STORE" --icon "$APP_ICON"
+            return
+        fi
+    done
+    die "持续显示的窗口需要 python3-gi 和 gir1.2-gtk-3.0；请安装后重新打开。"
 }
 
 usage() {

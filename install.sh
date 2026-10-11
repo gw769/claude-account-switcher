@@ -10,9 +10,19 @@ SRC_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 BIN_DIR="$HOME/.local/bin"
 APP_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
 DESKTOP_FILE="$APP_DIR/claude-account-switcher.desktop"
+ICON_THEME="${XDG_DATA_HOME:-$HOME/.local/share}/icons/hicolor"
+ICON_FILE="$ICON_THEME/scalable/apps/claude-account-switcher.svg"
+
+refresh_icons() {
+    if command -v gtk-update-icon-cache >/dev/null; then
+        gtk-update-icon-cache -f -t "$ICON_THEME" >/dev/null 2>&1 || true
+    fi
+}
 
 uninstall() {
-    rm -f -- "$BIN_DIR/claude-account" "$BIN_DIR/claude-account-sessions.py" "$BIN_DIR/claude-account-usage.py" "$DESKTOP_FILE"
+    rm -f -- "$BIN_DIR/claude-account" "$BIN_DIR/claude-account-sessions.py" "$BIN_DIR/claude-account-usage.py" "$BIN_DIR/claude-account-gui.py" "$DESKTOP_FILE"
+    rm -f -- "$ICON_FILE"
+    refresh_icons
     update-desktop-database "$APP_DIR" 2>/dev/null || true
     echo "已移除 claude-account。"
     echo "帳號資料沒有變動。如果之前切換過帳號，請在移除前先執行 claude-account restore。"
@@ -30,6 +40,11 @@ for dep in zenity flock setsid gio python3; do
         exit 1
     fi
 done
+if ! python3 -c 'import gi; gi.require_version("Gtk", "3.0"); from gi.repository import Gtk' >/dev/null 2>&1 && \
+   ! /usr/bin/python3 -c 'import gi; gi.require_version("Gtk", "3.0"); from gi.repository import Gtk' >/dev/null 2>&1; then
+    echo "缺少 GTK 图形组件。Ubuntu/Debian 可执行：sudo apt install python3-gi gir1.2-gtk-3.0" >&2
+    exit 1
+fi
 if [[ ! -x ${CLAUDE_ACCOUNT_EXE:-/usr/lib/claude-desktop/claude-desktop} ]]; then
     echo "警告：找不到 /usr/lib/claude-desktop/claude-desktop。" >&2
     echo "      若 Claude Desktop 裝在別處，請設定 CLAUDE_ACCOUNT_EXE。" >&2
@@ -38,6 +53,8 @@ fi
 install -D -m 755 -- "$SRC_DIR/claude-account" "$BIN_DIR/claude-account"
 install -D -m 755 -- "$SRC_DIR/claude-account-sessions.py" "$BIN_DIR/claude-account-sessions.py"
 install -D -m 755 -- "$SRC_DIR/claude-account-usage.py" "$BIN_DIR/claude-account-usage.py"
+install -D -m 755 -- "$SRC_DIR/claude-account-gui.py" "$BIN_DIR/claude-account-gui.py"
+install -D -m 644 -- "$SRC_DIR/icons/claude-account-switcher.svg" "$ICON_FILE"
 echo "✓ 已安裝 $BIN_DIR/claude-account"
 
 mkdir -p -- "$APP_DIR"
@@ -51,13 +68,15 @@ Comment=Switch Claude Desktop between accounts
 Comment[zh_CN]=查看账号额度和重置时间，切换时保留本机 Code 对话
 Comment[zh_TW]=在多個 Claude Desktop 帳號之間切換
 Exec=$BIN_DIR/claude-account gui
-Icon=claude-desktop
+Icon=claude-account-switcher
+StartupWMClass=claude-account-switcher
 Terminal=false
 Categories=Utility;
 Keywords=claude;account;switch;帳號;切換;
 StartupNotify=false
 EOF
 update-desktop-database "$APP_DIR" 2>/dev/null || true
+refresh_icons
 echo "✓ 已加入應用程式選單：「Claude 帳號切換」"
 
 if [[ ":$PATH:" != *":$BIN_DIR:"* ]]; then
