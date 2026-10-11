@@ -40,7 +40,19 @@ else
 fi
 echo "$opened" >>"$T/launches"
 "$T/lib/claude-desktop" "$T/fake-helper.sh" --type=renderer &
-if [[ -e $T/stubborn ]]; then trap '' TERM; else trap 'exit 0' TERM; fi
+close_fake() {
+    if [[ -n ${FAKE_FINAL_CARD:-} ]]; then
+        python3 - "$FAKE_FINAL_CARD" <<'PY'
+import json, pathlib, sys
+p = pathlib.Path(sys.argv[1])
+d = json.loads(p.read_text())
+d.update(completedTurns=2, lastActivityAt=20)
+p.write_text(json.dumps(d))
+PY
+    fi
+    exit 0
+}
+if [[ -e $T/stubborn ]]; then trap '' TERM; else trap close_fake TERM; fi
 if [[ -n ${FAKE_RUN:-} ]]; then
     bash -c "$FAKE_RUN" &
 fi
@@ -276,6 +288,7 @@ stop_fake
 
 ca restore --yes
 check "restore succeeds" ok
+# shellcheck disable=SC2088  # This is a literal test description, not a path.
 check "~/.config/Claude is a real folder again" test -d "$CFG/Claude" -a ! -L "$CFG/Claude"
 check "…holding the account that was active" grep -q main-data "$CFG/Claude/marker"
 check "…without the marker link" test ! -e "$CFG/Claude-accounts/main" -a ! -L "$CFG/Claude-accounts/main"
@@ -396,6 +409,96 @@ ca switch two --yes
 check "detached: switching picks an account again" ok
 check "…two is active" is_active two
 check "…with its data" grep -q two-data "$CFG/Claude/marker"
+stop_fake
+
+# ── Desktop-only Code conversation continuity ───────────────
+
+CFG="$T/config-sessions"
+P="$T/claude-home/projects"
+python3 - "$CFG" "$P" "$T/project" <<'PY'
+import json, pathlib, sys
+cfg, projects, project = map(pathlib.Path, sys.argv[1:])
+project.mkdir()
+a = "11111111-1111-1111-1111-111111111111"
+b = "22222222-2222-2222-2222-222222222222"
+org = "33333333-3333-3333-3333-333333333333"
+sid = "44444444-4444-4444-4444-444444444444"
+cli = "55555555-5555-5555-5555-555555555555"
+for root, account in ((cfg / "Claude", a), (cfg / "Claude-accounts/work", b)):
+    bucket = root / "claude-code-sessions" / account / org
+    bucket.mkdir(parents=True)
+    (root / "config.json").write_text(json.dumps({"lastKnownAccountUuid": account,
+        "oauth:tokenCacheV2": "SYNTHETIC-CREDENTIAL"}))
+card = {"sessionId": "local_" + sid, "cliSessionId": cli,
+        "cwd": str(project), "originCwd": str(project),
+        "title": "Synthetic Desktop conversation", "completedTurns": 1,
+        "lastActivityAt": 10}
+src = cfg / "Claude/claude-code-sessions" / a / org / ("local_" + sid + ".json")
+src.write_text(json.dumps(card))
+(projects / "session-fixture").mkdir()
+(projects / "session-fixture" / (cli + ".jsonl")).write_text('{"type":"user","text":"fixture"}\n')
+PY
+A_UUID=11111111-1111-1111-1111-111111111111
+B_UUID=22222222-2222-2222-2222-222222222222
+ORG_UUID=33333333-3333-3333-3333-333333333333
+SID_UUID=44444444-4444-4444-4444-444444444444
+CLI_UUID=55555555-5555-5555-5555-555555555555
+A_INDEX="$CFG/Claude/claude-code-sessions/$A_UUID/$ORG_UUID/local_$SID_UUID.json"
+cp "$CFG/Claude/config.json" "$T/a-config-before"
+cp "$CFG/Claude-accounts/work/config.json" "$T/b-config-before"
+cp "$P/session-fixture/$CLI_UUID.jsonl" "$T/history-before"
+
+has_turns() {
+    python3 - "$1" "$2" <<'PY'
+import json, pathlib, sys
+try: value = json.loads(pathlib.Path(sys.argv[1]).read_text()).get('completedTurns')
+except (OSError, ValueError): sys.exit(1)
+sys.exit(0 if value == int(sys.argv[2]) else 1)
+PY
+}
+
+ca init main --yes
+start_fake env FAKE_FINAL_CARD="$A_INDEX"
+printf '%s\n' '0|switch:work' '0|' >"$T/answers"
+ca gui
+check "Desktop sync: switching via GUI succeeds" ok
+check "Desktop sync: B is active" is_active work
+B_INDEX="$CFG/Claude/claude-code-sessions/$B_UUID/$ORG_UUID/local_$SID_UUID.json"
+check "Desktop sync: B receives the turn saved on app quit" has_turns "$B_INDEX" 2
+check "Desktop sync: A retains its original conversation card" has_turns "$CFG/Claude-accounts/main/claude-code-sessions/$A_UUID/$ORG_UUID/local_$SID_UUID.json" 2
+check "Desktop sync: original transcript remains byte-identical" cmp -s "$T/history-before" "$P/session-fixture/$CLI_UUID.jsonl"
+check "Desktop sync: A credential file remains byte-identical" cmp -s "$T/a-config-before" "$CFG/Claude-accounts/main/config.json"
+check "Desktop sync: B credential file remains byte-identical" cmp -s "$T/b-config-before" "$CFG/Claude/config.json"
+check "Desktop sync: GUI offers a sync action" grep -q "同步 Code 對話" "$T/zenity.log"
+
+python3 - "$B_INDEX" "$P/session-fixture/$CLI_UUID.jsonl" <<'PY'
+import json, pathlib, sys
+p, history = map(pathlib.Path, sys.argv[1:])
+card = json.loads(p.read_text())
+card.update(completedTurns=3, lastActivityAt=30, title="Continued in B")
+p.write_text(json.dumps(card))
+with history.open('a') as out: out.write('{"type":"assistant","text":"B continuation fixture"}\n')
+PY
+cp "$P/session-fixture/$CLI_UUID.jsonl" "$T/history-after-b"
+printf '%s\n' '0|switch:main' '0|' >"$T/answers"
+ca gui
+check "Desktop sync: returning to A via GUI succeeds" ok
+check "Desktop sync: A sees the continuation saved in B" has_turns "$A_INDEX" 3
+check "Desktop sync: B retains the continuation after switching away" has_turns "$CFG/Claude-accounts/work/claude-code-sessions/$B_UUID/$ORG_UUID/local_$SID_UUID.json" 3
+check "Desktop sync: both saved turns remain byte-identical" cmp -s "$T/history-after-b" "$P/session-fixture/$CLI_UUID.jsonl"
+
+printf '%s\n' '0|sync' '0|' >"$T/answers"
+ca gui
+check "Desktop sync: manual sync works entirely through GUI" ok
+check "Desktop sync: manual sync keeps the active profile" is_active main
+
+mkdir -p "$CFG/Claude-accounts/work/claude-code-sessions/$B_UUID/66666666-6666-6666-6666-666666666666"
+current_pid=$(fake_main_pids)
+printf '%s\n' '0|switch:work' '0|' >"$T/answers"
+ca gui
+check "Desktop sync: ambiguous destination is refused" failed
+check "Desktop sync: refusal keeps A active" is_active main
+check "Desktop sync: refusal leaves the running app alive" test -d "/proc/$current_pid"
 stop_fake
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"

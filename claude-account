@@ -10,7 +10,7 @@
 
 set -Eeuo pipefail
 
-readonly VERSION="0.2.0"
+readonly VERSION="0.3.0-local"
 
 CONFIG_HOME=${XDG_CONFIG_HOME:-$HOME/.config}
 LINK="$CONFIG_HOME/Claude"            # where Claude Desktop keeps its data
@@ -22,6 +22,8 @@ APP_EXE=${CLAUDE_ACCOUNT_EXE:-/usr/lib/claude-desktop/claude-desktop}
 QUIT_TIMEOUT=${CLAUDE_ACCOUNT_QUIT_TIMEOUT:-30}
 
 SELF=$(readlink -f -- "${BASH_SOURCE[0]}")
+SESSION_HELPER="${SELF%/*}/claude-account-sessions.py"
+SESSION_SUMMARY=""
 UI=${CLAUDE_ACCOUNT_UI:-cli}   # "gui": dialogs instead of terminal output
 ASSUME_YES=0
 
@@ -295,6 +297,7 @@ main_pids() {
 # Renderers, crash handler, cowork helper: anything run from the install folder.
 app_pids() {
     pids_with_exe "${APP_EXE%/*}/*"
+    pids_with_exe "$LINK/claude-code*"
 }
 
 claude_running() {
@@ -347,7 +350,10 @@ quit_claude() {
         wait_until_gone main_pids 10 || return 1
     fi
     # Let helpers finish writing before the data folder changes under them.
-    wait_until_gone app_pids 10 || log "some helper processes are still running; continuing"
+    if ! wait_until_gone app_pids 10; then
+        log "some helper processes are still running; refusing to change data"
+        return 1
+    fi
     log "Claude Desktop closed"
 }
 
@@ -387,6 +393,25 @@ release_lock() {
     exec 9>&-
 }
 
+# The helper reads only the account UUID from config.json. It writes local Code
+# sidebar/workspace data, never credentials, transcripts, or network requests.
+sync_code_sessions() {
+    local target_root=$1
+    shift
+    if ! command -v python3 >/dev/null || [[ ! -r $SESSION_HELPER ]]; then
+        SESSION_SUMMARY="缺少 Code 對話同步程式或 python3；請重新安裝此工具。"
+        return 1
+    fi
+    if SESSION_SUMMARY=$(python3 "$SESSION_HELPER" \
+        --active-root "$LINK" --store "$STORE" --target-root "$target_root" \
+        --projects "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects" "$@" 2>&1); then
+        log "$SESSION_SUMMARY"
+        return 0
+    fi
+    log "Code sync failed: $SESSION_SUMMARY"
+    return 1
+}
+
 # ── the core operation ───────────────────────────────────────
 
 # Close Claude, rearrange folders, start Claude again.
@@ -406,6 +431,12 @@ transition() {
     fi
     take_lock
 
+    # Fail before closing Claude if the destination is ambiguous or damaged.
+    if [[ -n $target ]] && ! sync_code_sessions "$STORE/$target" --check; then
+        release_lock
+        die "$SESSION_SUMMARY"
+    fi
+
     if ! quit_claude; then
         release_lock
         die "Claude Desktop 沒有關閉，沒有做任何變更。"
@@ -420,11 +451,16 @@ transition() {
         adopt_current_folder "$adopt_as" || ok=0
     fi
     if [[ $ok == 1 && -n $target ]] && ! account_exists "$target"; then
-        mkdir -m 700 -p -- "$STORE/$target" && log "created account $target" || ok=0
+        mkdir -m 700 -- "$STORE/$target" && log "created account $target" || ok=0
     fi
     if [[ $ok == 1 ]]; then
         if [[ -n $target ]]; then
-            activate "$target" || ok=0
+            # Re-read after a graceful quit: the last completed turn is now saved.
+            if sync_code_sessions "$STORE/$target"; then
+                activate "$target" || ok=0
+            else
+                ok=0
+            fi
         else
             restore_real_folder || ok=0
         fi
@@ -435,7 +471,7 @@ transition() {
         launch_claude || true
     fi
     release_lock
-    [[ $ok == 1 ]] || die "切換沒有完成，詳情請看 $LOG"
+    [[ $ok == 1 ]] || die "切換沒有完成。${SESSION_SUMMARY:-詳情請看 $LOG}"
     if (( TRANSCRIPT_CONFLICTS > 0 )); then
         say "注意：有 $TRANSCRIPT_CONFLICTS 個「No folder」對話在新舊兩個位置都有紀錄，沒有自動合併。詳情請看 $LOG"
     fi
@@ -522,7 +558,8 @@ cmd_add() {
     fi
     say "Claude Desktop 正以新帳號「$name」開啟。
 
-等登入畫面出現後登入即可，登入狀態會自動保存。"
+等登入畫面出現後登入即可，登入狀態會自動保存。
+登入後開啟 Code 分頁，再從帳號切換工具選「同步 Code 對話」，即可帶入先前的本機對話。"
 }
 
 cmd_switch() {
@@ -543,7 +580,7 @@ cmd_switch() {
         return 0
     fi
     transition "$name" "" always switch "$name"
-    notify "已切換到「$name」"
+    notify "已切換到「$name」。$SESSION_SUMMARY"
     [[ $UI == gui ]] || echo "已切換到「$name」。"
 }
 
@@ -580,6 +617,32 @@ cmd_restore() {
         transition "" "" if-running restore
     fi
     say "已還原：$LINK 現在是「$name」的資料夾。"
+}
+
+cmd_sync() {
+    require_not_foreign
+    [[ -d $LINK ]] || die "請先開啟 Claude Desktop、登入帳號並開啟 Code 分頁。"
+    local was_running=0
+    claude_running && was_running=1
+    if [[ $was_running == 1 ]]; then
+        confirm "會先關閉 Claude Desktop，保存的 Code 對話會同步到目前帳號，然後重新開啟。正在執行的回覆會中斷。" "同步並重新開啟" || exit 0
+        detach_if_inside_claude sync
+    fi
+    take_lock
+    if ! sync_code_sessions "$LINK" --check; then
+        release_lock
+        die "$SESSION_SUMMARY"
+    fi
+    if ! quit_claude; then
+        release_lock
+        die "Claude Desktop 沒有關閉，沒有同步任何對話。"
+    fi
+    local ok=1
+    sync_code_sessions "$LINK" || ok=0
+    if [[ $was_running == 1 ]]; then launch_claude || true; fi
+    release_lock
+    [[ $ok == 1 ]] || die "$SESSION_SUMMARY"
+    say "$SESSION_SUMMARY"
 }
 
 # ── GUI (zenity) ─────────────────────────────────────────────
@@ -623,14 +686,21 @@ cmd_gui() {
         rows+=("upgrade" "轉換成新的資料夾配置（修正 Code 對話顯示舊紀錄）")
     fi
     rows+=("add" "新增帳號…")
+    if [[ -d $LINK ]]; then
+        rows+=("sync" "同步 Code 對話（目前帳號）")
+    fi
+    if [[ -d $LINK/.code-sync-backups ]]; then
+        rows+=("backups" "開啟對話同步備份")
+    fi
     if [[ $others == 1 ]]; then
         rows+=("remove" "移除帳號…")
     fi
 
     local header="目前帳號：<b>${active:-（尚未命名）}</b>"
+    header+=$'\n切換時保留並同步本機 Code 對話。'
     choice=$(zenity --list --title="Claude 帳號切換" --text="$header" \
         --column="key" --column="動作" --hide-column=1 --print-column=1 \
-        --hide-header --width=380 --height=320 "${rows[@]}" 2>/dev/null) || exit 0
+        --hide-header --width=440 --height=380 "${rows[@]}" 2>/dev/null) || exit 0
 
     case $choice in
         switch:*)
@@ -638,6 +708,12 @@ cmd_gui() {
             ;;
         upgrade)
             cmd_switch "$active"
+            ;;
+        sync)
+            cmd_sync
+            ;;
+        backups)
+            gio open "$LINK/.code-sync-backups" 2>/dev/null || die "無法開啟備份資料夾。"
             ;;
         add)
             local adopt_as=""
@@ -668,6 +744,7 @@ claude-account $VERSION — 在多個 Claude Desktop 帳號之間切換（Linux�
   claude-account init <名稱>         替目前登入的帳號命名（第一次使用）
   claude-account add <名稱>          新增空白帳號並切換過去，然後在 Claude 中登入
   claude-account switch <名稱>       切換帳號（會關閉並重新開啟 Claude Desktop）
+  claude-account sync                同步本機 Code 對話到目前帳號
   claude-account remove <名稱>       把帳號的本機資料移到垃圾桶
   claude-account restore             還原成普通的單一帳號設定
 
@@ -706,6 +783,7 @@ main() {
             cmd_add "${1:-}" "$adopt_as"
             ;;
         switch | use) cmd_switch "$@" ;;
+        sync) cmd_sync ;;
         remove | rm) cmd_remove "$@" ;;
         restore) cmd_restore ;;
         help) usage ;;
