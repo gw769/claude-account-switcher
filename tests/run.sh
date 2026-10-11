@@ -314,18 +314,23 @@ check "gui add: Claude reopened in the new account" wait_for last_launch_is work
 check "gui add: asked before closing Claude" grep -q -- "--question" "$T/zenity.log"
 check "gui add: told the user to log in" grep -q "登入" "$T/zenity.log"
 
+selector_count_before=$(grep -c -- '--extra-button=刷新额度' "$T/zenity.log" || true)
 printf '%s\n' '0|switch:personal' '0|' >"$T/answers"
 ca gui
 check "gui switch: personal is active" is_active personal
 check "gui switch: notification sent" grep -q personal "$T/notify.log"
+selector_count_after=$(grep -c -- '--extra-button=刷新额度' "$T/zenity.log" || true)
+check "resident GUI: selector reopens after switching" test "$selector_count_after" -eq "$((selector_count_before + 2))"
 
 printf '%s\n' '0|switch:work' '1|' >"$T/answers"
 ca gui
 check "gui switch: cancelling the close question changes nothing" is_active personal
 
+errors_before=$(grep -c -- '--error' "$T/zenity.log" || true)
 printf '%s\n' '0|add' '0|bad/name' >"$T/answers"
 ca gui
-check "gui add: invalid name rejected" failed
+errors_after=$(grep -c -- '--error' "$T/zenity.log" || true)
+check "gui add: invalid name rejected" test "$errors_after" -eq "$((errors_before + 1))"
 check "gui add: …nothing changed" is_active personal
 check "gui add: only one error dialog, no 'unexpected error'" test "$(grep -c "未預期" "$T/zenity.log")" = 0
 
@@ -494,11 +499,31 @@ check "Desktop sync: manual sync keeps the active profile" is_active main
 
 mkdir -p "$CFG/Claude-accounts/work/claude-code-sessions/$B_UUID/66666666-6666-6666-6666-666666666666"
 current_pid=$(fake_main_pids)
+errors_before=$(grep -c -- '--error' "$T/zenity.log" || true)
 printf '%s\n' '0|switch:work' '0|' >"$T/answers"
 ca gui
-check "Desktop sync: ambiguous destination is refused" failed
+errors_after=$(grep -c -- '--error' "$T/zenity.log" || true)
+check "Desktop sync: ambiguous destination is refused" test "$errors_after" -eq "$((errors_before + 1))"
 check "Desktop sync: refusal keeps A active" is_active main
 check "Desktop sync: refusal leaves the running app alive" test -d "/proc/$current_pid"
+
+selector_count_before=$(grep -c -- '--extra-button=刷新额度' "$T/zenity.log" || true)
+printf '%s\n' '1|刷新额度' '1|' >"$T/answers"
+ca gui
+selector_count_after=$(grep -c -- '--extra-button=刷新额度' "$T/zenity.log" || true)
+check "Desktop usage: refresh returns to the account selector" test "$selector_count_after" -eq "$((selector_count_before + 2))"
+check "Desktop usage: refresh actually saves a quota result" test -s "$CFG/Claude-accounts/.usage-cache.json"
+check "Desktop usage: selector has weekly quota and reset columns" grep -q -- '--column=周额度 --column=周重置时间' "$T/zenity.log"
+check "Desktop usage: selector has five-hour quota and reset columns" grep -q -- '--column=5 小时额度 --column=5 小时重置时间' "$T/zenity.log"
+check "Desktop usage: refresh button is in the account selector" grep -q -- '--extra-button=刷新额度' "$T/zenity.log"
+check "Desktop usage: refresh never closes the running Desktop" test -d "/proc/$current_pid"
+check "Desktop usage: refresh keeps source credentials unchanged" cmp -s "$T/a-config-before" "$CFG/Claude/config.json"
+check "Desktop usage: refresh keeps parked credentials unchanged" cmp -s "$T/b-config-before" "$CFG/Claude-accounts/work/config.json"
+selector_count_before=$(grep -c -- '--extra-button=刷新额度' "$T/zenity.log" || true)
+printf '%s\n' '0|active' '1|' >"$T/answers"
+ca gui
+selector_count_after=$(grep -c -- '--extra-button=刷新额度' "$T/zenity.log" || true)
+check "resident GUI: selecting current account keeps the window available" test "$selector_count_after" -eq "$((selector_count_before + 2))"
 stop_fake
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"

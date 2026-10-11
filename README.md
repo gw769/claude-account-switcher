@@ -2,11 +2,11 @@
 
 在 Linux 上讓 **Claude Desktop** 保存多個已登入的帳號，切換時不用重新登入。
 
-此版本 `0.3.0-local` 的目標：切换时同步本机 **Code 分页**对话。A 的原始历史保留，B 从 Desktop 侧栏打开同一会话继续；切回 A 时带回 B 保存的新会话状态。普通 Chat 和云端会话仍绑定原账号。
+此版本 `0.4.1-local` 支持 GUI 常驻，在账号选择界面查看每个账号的周额度、周重置时间、5 小时额度和 5 小时重置时间。切换时同步本机 **Code 分页**对话：A 的原始历史保留，B 从 Desktop 侧栏打开同一会话继续；切回 A 时带回 B 保存的新会话状态。普通 Chat 和云端会话仍绑定原账号。
 
-**不能保证不封号。** 这是非官方工具；[Anthropic 消费者条款](https://www.anthropic.com/legal/consumer-terms)禁止绕过系统或保护措施。此版本只提供手动切号与本机同步，不检测额度、不自动轮换、不改写网络请求或凭据内容。
+**不能保证不封号。** 这是非官方工具；[Anthropic 消费者条款](https://www.anthropic.com/legal/consumer-terms)禁止绕过系统或保护措施。此版本提供手动切号、本机同步和只读用量查询，不自动轮换，不发送模型请求，不刷新或改写凭据。
 
-适用于 Linux Claude Desktop（`claude-desktop` 套件）。本机只读预检版本为 `1.28929.0`；同步功能已做合成资料与假 app 测试，真实账号切换续聊尚未实测。
+适用于 Linux Claude Desktop（`claude-desktop` 套件）。本轮在 101 的 Desktop `2.31226.0` 上实测：两个账号额度刷新成功，刷新及选择当前账号后窗口继续显示；26 个登录和会话文件没有变化，Desktop 主进程没有重启。同步功能已做合成资料与假 app 测试，真实账号切换续聊尚未实测。
 
 ## 運作方式
 
@@ -34,6 +34,8 @@ Claude Desktop 永遠讀寫 `~/.config/Claude`，切換帳號就是：
 
 需要：`claude-desktop`、`python3`、`zenity`（GNOME 通常已內建）。
 
+实时额度读取还需要 `python3-cryptography`、`python3-gi`、`gir1.2-secret-1` 和已解锁的系统密钥环。缺少支持时仍可切号，额度栏会显示本机快照或不可用。
+
 ```bash
 git clone https://github.com/gw769/claude-account-switcher.git
 cd claude-account-switcher
@@ -56,6 +58,20 @@ bash install.sh
 ### 之後切換
 
 開啟「Claude 帳號切換」→ **切換到「work」**。Claude Desktop 會關閉並以該帳號重新開啟。
+
+### 在账号选择界面看额度
+
+每个账号一行，直接显示 **周额度 / 周重置时间 / 5 小时额度 / 5 小时重置时间**。额度为套餐剩余百分比；重置时间按本机时区显示，旁边标明更新时间。
+
+窗口保持运行，切号、同步、取消操作或报错后仍返回账号选择界面；选中当前账号不会退出。点 **关闭**、按 Esc 或关闭窗口才退出。额度查询由 **刷新额度** 按钮触发，窗口常驻不会自动查询或自动切号。
+
+点击 **刷新额度** 后，读取各账号已有的 Desktop 登录状态，先核对服务器返回的账号身份，再只读查询用量。每个账号最多一分钟刷新一次；收到限流后按服务器要求等待。登录内容只在内存中使用，不打印、不缓存、不刷新，也不读取 CLI 的登录文件。
+
+首次未刷新时可显示 Desktop 的本机百分比快照；快照没有重置时间，显示未知。服务器确认未启动的窗口显示未开始；记录已到重置时间后显示待刷新，不假定额度已经清零，也不推算下一次重置。登录过期、网络失败和限流都保留上次有效数据并标明状态。
+
+用量查询使用 Desktop 同样访问的 `api.anthropic.com/api/oauth/profile` 和 `api.anthropic.com/api/oauth/usage`，这些接口没有公开的稳定性保证。官方用量页仍为准：[用量说明](https://support.claude.com/en/articles/9797557-usage-limit-best-practices)。界面布局和只读查询不代表封号风险已验证。
+
+相同的 Desktop 登录状态读取和只读用量查询已有公开实现：[SnlperStripes 的 usage.go](https://github.com/SnlperStripes/claude-account-switcher/blob/main/usage.go)（Apache-2.0）和 [claude-usage-assistant](https://github.com/huanchong-99/claude-usage-assistant/blob/main/quota_card.py)（MIT）。本轮对 Linux 密钥环和多账号选择界面做了适配；开源前例不代表官方授权或零封号风险。
 
 ### 在 Desktop 接续原对话
 
@@ -138,6 +154,7 @@ bash install.sh --uninstall
 ```bash
 bash tests/run.sh
 python3 tests/test_sessions.py
+python3 tests/test_usage.py
 ```
 
 測試使用假的 Claude 程序，暫存檔放在 repo 內的 `.test-tmp/`（不放 `/tmp`，跑完自動清掉），不會動到真正的 `~/.config/Claude` 或正在執行的 Claude。

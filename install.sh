@@ -12,7 +12,7 @@ APP_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
 DESKTOP_FILE="$APP_DIR/claude-account-switcher.desktop"
 
 uninstall() {
-    rm -f -- "$BIN_DIR/claude-account" "$BIN_DIR/claude-account-sessions.py" "$DESKTOP_FILE"
+    rm -f -- "$BIN_DIR/claude-account" "$BIN_DIR/claude-account-sessions.py" "$BIN_DIR/claude-account-usage.py" "$DESKTOP_FILE"
     update-desktop-database "$APP_DIR" 2>/dev/null || true
     echo "已移除 claude-account。"
     echo "帳號資料沒有變動。如果之前切換過帳號，請在移除前先執行 claude-account restore。"
@@ -37,6 +37,7 @@ fi
 
 install -D -m 755 -- "$SRC_DIR/claude-account" "$BIN_DIR/claude-account"
 install -D -m 755 -- "$SRC_DIR/claude-account-sessions.py" "$BIN_DIR/claude-account-sessions.py"
+install -D -m 755 -- "$SRC_DIR/claude-account-usage.py" "$BIN_DIR/claude-account-usage.py"
 echo "✓ 已安裝 $BIN_DIR/claude-account"
 
 mkdir -p -- "$APP_DIR"
@@ -47,7 +48,7 @@ Name=Claude Account Switcher
 Name[zh_CN]=Claude 账号切换
 Name[zh_TW]=Claude 帳號切換
 Comment=Switch Claude Desktop between accounts
-Comment[zh_CN]=切换 Claude Desktop 账号并保留本机 Code 对话
+Comment[zh_CN]=查看账号额度和重置时间，切换时保留本机 Code 对话
 Comment[zh_TW]=在多個 Claude Desktop 帳號之間切換
 Exec=$BIN_DIR/claude-account gui
 Icon=claude-desktop

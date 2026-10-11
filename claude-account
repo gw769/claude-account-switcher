@@ -10,7 +10,7 @@
 
 set -Eeuo pipefail
 
-readonly VERSION="0.3.0-local"
+readonly VERSION="0.4.1-local"
 
 CONFIG_HOME=${XDG_CONFIG_HOME:-$HOME/.config}
 LINK="$CONFIG_HOME/Claude"            # where Claude Desktop keeps its data
@@ -23,6 +23,7 @@ QUIT_TIMEOUT=${CLAUDE_ACCOUNT_QUIT_TIMEOUT:-30}
 
 SELF=$(readlink -f -- "${BASH_SOURCE[0]}")
 SESSION_HELPER="${SELF%/*}/claude-account-sessions.py"
+USAGE_HELPER="${SELF%/*}/claude-account-usage.py"
 SESSION_SUMMARY=""
 UI=${CLAUDE_ACCOUNT_UI:-cli}   # "gui": dialogs instead of terminal output
 ASSUME_YES=0
@@ -647,6 +648,23 @@ cmd_sync() {
 
 # ── GUI (zenity) ─────────────────────────────────────────────
 
+gui_refresh_usage() {
+    local summary active
+    [[ -r $USAGE_HELPER ]] || { say "缺少额度组件；请重新安装。"; return 0; }
+    active=$(active_account)
+    if summary=$(python3 "$USAGE_HELPER" --active-root "$LINK" --store "$STORE" \
+        --active-name "$active" --refresh --progress 2>&1); then
+        notify "$summary"
+    else
+        say "$summary"
+    fi
+}
+
+gui_backend() {
+    # Keep the selector alive even if an action is cancelled or reports an error.
+    CLAUDE_ACCOUNT_UI=gui "$SELF" "$@" || true
+}
+
 gui_ask_name() { # $1 prompt, $2 default text
     local name
     name=$(zenity --entry --title="Claude 帳號切換" --text="$1" \
@@ -675,63 +693,94 @@ cmd_gui() {
     command -v zenity >/dev/null || { UI=cli; die "需要 zenity：sudo apt install zenity"; }
     require_not_foreign
 
-    local active name choice others=0 rows=()
-    active=$(active_account)
-    while IFS= read -r name; do
-        [[ -n $name && $name != "$active" ]] || continue
-        rows+=("switch:$name" "切換到「$name」")
-        others=1
-    done < <(list_accounts)
-    if [[ $(link_state) == legacy ]]; then
-        rows+=("upgrade" "轉換成新的資料夾配置（修正 Code 對話顯示舊紀錄）")
-    fi
-    rows+=("add" "新增帳號…")
-    if [[ -d $LINK ]]; then
-        rows+=("sync" "同步 Code 對話（目前帳號）")
-    fi
-    if [[ -d $LINK/.code-sync-backups ]]; then
-        rows+=("backups" "開啟對話同步備份")
-    fi
-    if [[ $others == 1 ]]; then
-        rows+=("remove" "移除帳號…")
-    fi
+    local active name choice others=0 rows=() usage_cells=()
+    while :; do
+        active=$(active_account)
+        rows=()
+        usage_cells=()
+        others=0
+        if [[ -r $USAGE_HELPER ]]; then
+            mapfile -d '' -t usage_cells < <(python3 "$USAGE_HELPER" \
+                --active-root "$LINK" --store "$STORE" --active-name "$active" --rows 2>/dev/null)
+        fi
+        if (( ${#usage_cells[@]} > 0 && ${#usage_cells[@]} % 7 == 0 )); then
+            rows+=("${usage_cells[@]}")
+        else
+            [[ -d $LINK ]] && rows+=("active" "${active:-尚未命名}（当前）" "不可用" "未知" "不可用" "未知" "额度组件不可用")
+            while IFS= read -r name; do
+                [[ -n $name && $name != "$active" ]] || continue
+                rows+=("switch:$name" "$name" "不可用" "未知" "不可用" "未知" "额度组件不可用")
+            done < <(list_accounts)
+        fi
+        while IFS= read -r name; do
+            [[ -n $name && $name != "$active" ]] && others=1
+        done < <(list_accounts)
+        if [[ $(link_state) == legacy ]]; then
+            rows+=("upgrade" "轉換資料夾配置（修正舊紀錄）" "" "" "" "" "")
+        fi
+        rows+=("add" "新增帳號…" "" "" "" "" "")
+        if [[ -d $LINK ]]; then
+            rows+=("sync" "同步 Code 對話（目前帳號）" "" "" "" "" "")
+        fi
+        if [[ -d $LINK/.code-sync-backups ]]; then
+            rows+=("backups" "開啟對話同步備份" "" "" "" "" "")
+        fi
+        if [[ $others == 1 ]]; then
+            rows+=("remove" "移除帳號…" "" "" "" "" "")
+        fi
 
-    local header="目前帳號：<b>${active:-（尚未命名）}</b>"
-    header+=$'\n切換時保留並同步本機 Code 對話。'
-    choice=$(zenity --list --title="Claude 帳號切換" --text="$header" \
-        --column="key" --column="動作" --hide-column=1 --print-column=1 \
-        --hide-header --width=440 --height=380 "${rows[@]}" 2>/dev/null) || exit 0
+        local header="目前帳號：<b>${active:-（尚未命名）}</b>"
+        header+=$'\n额度显示剩余百分比；点击「刷新额度」读取所有账号的最新用量。'
+        header+=$'\n窗口常驻；切号后返回此界面，点「关闭」退出。'
+        header+=$'\n重置时间使用本机时区：'
+        header+="$(date '+%Z %z')"
+        choice=$(zenity --list --title="Claude 帳號切換" --text="$header" \
+            --column="key" --column="账号 / 动作" --column="周额度" --column="周重置时间" \
+            --column="5 小时额度" --column="5 小时重置时间" --column="更新时间 / 状态" \
+            --hide-column=1 --print-column=1 --extra-button="刷新额度" \
+            --ok-label="执行所选项" --cancel-label="关闭" --width=1140 --height=440 \
+            "${rows[@]}" 2>/dev/null) || [[ $choice == "刷新额度" ]] || exit 0
 
-    case $choice in
-        switch:*)
-            cmd_switch "${choice#switch:}"
-            ;;
-        upgrade)
-            cmd_switch "$active"
-            ;;
-        sync)
-            cmd_sync
-            ;;
-        backups)
-            gio open "$LINK/.code-sync-backups" 2>/dev/null || die "無法開啟備份資料夾。"
-            ;;
-        add)
-            local adopt_as=""
-            # gui_ask_name prints nothing on cancel and fails after showing its own error.
-            if [[ $(link_state) == unmanaged ]]; then
-                adopt_as=$(gui_ask_name "第一次使用：先替<b>目前登入</b>的帳號取個名字。" main) || exit 1
-                [[ -n $adopt_as ]] || exit 0
-            fi
-            name=$(gui_ask_name "新帳號的名稱（英文字母、數字、- 或 _）：" "") || exit 1
-            [[ -n $name ]] || exit 0
-            cmd_add "$name" "$adopt_as"
-            ;;
-        remove)
-            name=$(gui_pick_account "要移除哪個帳號？") || exit 0
-            [[ -n $name ]] || exit 0
-            cmd_remove "$name"
-            ;;
-    esac
+        case $choice in
+            "刷新额度")
+                gui_refresh_usage
+                continue
+                ;;
+            active) continue ;;
+            switch:*)
+                gui_backend switch "${choice#switch:}"
+                ;;
+            upgrade)
+                gui_backend switch "$active"
+                ;;
+            sync)
+                gui_backend sync
+                ;;
+            backups)
+                gio open "$LINK/.code-sync-backups" 2>/dev/null || say "無法開啟備份資料夾。"
+                ;;
+            add)
+                local adopt_as=""
+                # gui_ask_name prints nothing on cancel and fails after showing its own error.
+                if [[ $(link_state) == unmanaged ]]; then
+                    adopt_as=$(gui_ask_name "第一次使用：先替<b>目前登入</b>的帳號取個名字。" main) || continue
+                    [[ -n $adopt_as ]] || continue
+                fi
+                name=$(gui_ask_name "新帳號的名稱（英文字母、數字、- 或 _）：" "") || continue
+                [[ -n $name ]] || continue
+                if [[ -n $adopt_as ]]; then
+                    gui_backend add "$name" --as "$adopt_as"
+                else
+                    gui_backend add "$name"
+                fi
+                ;;
+            remove)
+                name=$(gui_pick_account "要移除哪個帳號？") || continue
+                [[ -n $name ]] || continue
+                gui_backend remove "$name"
+                ;;
+        esac
+    done
 }
 
 usage() {
